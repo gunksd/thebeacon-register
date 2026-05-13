@@ -3,6 +3,7 @@ node_modules/
 output/
 *.log
 *.csv
+inviter.json
 .DS_Store
 .env
 .env.*
