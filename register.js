@@ -1,16 +1,19 @@
-// Batch pre-register wallets against app.thebeacon.gg using captured flow:
-//   1) POST /api/core/graphql  mutation createSignatureNonce  → nonce
-//   2) GET  /auth/csrf                                        → csrfToken (+ csrf cookie)
-//   3) Build SIWE message, sign with the wallet's private key
-//   4) POST /auth/callback/wallet {csrfToken, method:"wallet", callbackUrl:"/profile",
-//                                  message, signature, referralCode}
-//   5) GET  /auth/session                                      → confirm session
+// Batch pre-register wallets against app.thebeacon.gg using captured flow.
+//
+// Each registered user can only invite a limited number (~10–15) before the
+// referral binding starts failing with /auth/error?error=Configuration. So we
+// keep a *pool* of referral codes:
+//   - seed code from --referral=<code>
+//   - every successful registration's wallet becomes a candidate inviter
+//   - when the active code is exhausted (or marked dead), we log into a
+//     candidate, query GraphQL for its referralCodes[0], add to the pool,
+//     and keep going
 //
 // Usage:
-//   node register.js                          (all wallets in output/wallets.csv)
-//   node register.js --from=1 --to=10
-//   node register.js --concurrency=5 --delay=1500
-//   node register.js --referral=YHDGDLXZTM --dry-run
+//   node register.js --referral=ABCD1234
+//   node register.js --referral=ABCD1234 --concurrency=2 --delay=3000
+//   node register.js --ref-max=9                    (uses per code before rotating)
+//   node register.js --from=1 --to=10 --dry-run
 
 import {
   readFileSync,
@@ -32,7 +35,7 @@ const argv = new Map(
     return [k, v ?? true];
   }),
 );
-const REFERRAL = String(argv.get("referral") ?? "YHDGDLXZTM");
+const SEED_REFERRAL = String(argv.get("referral") ?? "YHDGDLXZTM");
 const FROM = Number.parseInt(argv.get("from") ?? "1", 10);
 const TO = argv.get("to") ? Number.parseInt(argv.get("to"), 10) : Infinity;
 const CONCURRENCY = Math.max(
@@ -40,6 +43,7 @@ const CONCURRENCY = Math.max(
   Number.parseInt(argv.get("concurrency") ?? "3", 10),
 );
 const DELAY = Math.max(0, Number.parseInt(argv.get("delay") ?? "1000", 10));
+const REF_MAX = Math.max(1, Number.parseInt(argv.get("ref-max") ?? "9", 10));
 const DRY_RUN = Boolean(argv.get("dry-run"));
 
 const outDir = resolve(process.cwd(), "output");
@@ -47,12 +51,12 @@ mkdirSync(outDir, { recursive: true });
 const csvPath = resolve(outDir, "wallets.csv");
 const resultsPath = resolve(outDir, "register-results.csv");
 const logPath = resolve(outDir, "register.log");
+const poolPath = resolve(outDir, "referral-pool.json");
 
 if (!existsSync(csvPath)) {
   console.error(`missing ${csvPath} — run: node generate-wallets.js <n>`);
   process.exit(1);
 }
-
 if (!existsSync(resultsPath)) {
   writeFileSync(resultsPath, "index,address,status,userId,error\n");
 }
@@ -73,7 +77,6 @@ function loadWallets() {
 
 function alreadyDone() {
   const done = new Set();
-  if (!existsSync(resultsPath)) return done;
   const rows = readFileSync(resultsPath, "utf8").trim().split("\n").slice(1);
   for (const row of rows) {
     const [idx, , status] = row.split(",");
@@ -82,13 +85,13 @@ function alreadyDone() {
   return done;
 }
 
-// Minimal cookie jar: scope-agnostic (one origin) — keep name=value only.
+// --- HTTP helpers ---
+
 function makeJar() {
   const jar = new Map();
   return {
     setFromHeader(setCookieHeader) {
       if (!setCookieHeader) return;
-      // undici exposes set-cookie as a single joined string; split conservatively.
       const parts = Array.isArray(setCookieHeader)
         ? setCookieHeader
         : setCookieHeader.split(/,(?=[^;]+=)/);
@@ -105,19 +108,16 @@ function makeJar() {
     header() {
       return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
     },
-    get(k) {
-      return jar.get(k);
-    },
   };
 }
 
-function commonHeaders(jar, extra = {}) {
+function commonHeaders(jar, refCode, extra = {}) {
   const h = {
     "user-agent": UA,
     accept: "application/json, text/plain, */*",
     "accept-language": "en-US,en;q=0.9",
     origin: ORIGIN,
-    referer: `${ORIGIN}/pre-register?referralCode=${REFERRAL}`,
+    referer: `${ORIGIN}/pre-register${refCode ? `?referralCode=${refCode}` : ""}`,
     "sec-fetch-site": "same-origin",
     "sec-fetch-mode": "cors",
     "sec-fetch-dest": "empty",
@@ -128,10 +128,12 @@ function commonHeaders(jar, extra = {}) {
   return h;
 }
 
-async function requestNonce(jar) {
+async function requestNonce(jar, refCode) {
   const res = await fetch(`${ORIGIN}/api/core/graphql`, {
     method: "POST",
-    headers: commonHeaders(jar, { "content-type": "application/json" }),
+    headers: commonHeaders(jar, refCode, {
+      "content-type": "application/json",
+    }),
     body: JSON.stringify({
       query:
         "mutation useCreateNonceCreateNonceMutation { createSignatureNonce { __typename ... on CreateSignatureNonceSuccessResponse { signatureNonce { nonce id } } ... on CreateSignatureNonceFailResponse { errorCode _isError } } }",
@@ -149,10 +151,10 @@ async function requestNonce(jar) {
   return node.signatureNonce.nonce;
 }
 
-async function requestCsrf(jar) {
+async function requestCsrf(jar, refCode) {
   const res = await fetch(`${ORIGIN}/auth/csrf`, {
     method: "GET",
-    headers: commonHeaders(jar),
+    headers: commonHeaders(jar, refCode),
   });
   jar.setFromHeader(
     res.headers.getSetCookie?.() ?? res.headers.get("set-cookie"),
@@ -164,7 +166,6 @@ async function requestCsrf(jar) {
 }
 
 function buildSiweMessage({ address, nonce }) {
-  const issuedAt = new Date().toISOString();
   return [
     `app.thebeacon.gg wants you to sign in with your Ethereum account:`,
     address,
@@ -175,37 +176,36 @@ function buildSiweMessage({ address, nonce }) {
     `Version: 1`,
     `Chain ID: 42161`,
     `Nonce: ${nonce}`,
-    `Issued At: ${issuedAt}`,
+    `Issued At: ${new Date().toISOString()}`,
   ].join("\n");
 }
 
-async function submitCallback(jar, { csrfToken, message, signature }) {
+async function submitCallback(jar, refCode, body) {
   const res = await fetch(`${ORIGIN}/auth/callback/wallet`, {
     method: "POST",
-    headers: commonHeaders(jar, { "content-type": "application/json" }),
-    redirect: "manual",
-    body: JSON.stringify({
-      csrfToken,
-      method: "wallet",
-      callbackUrl: "/profile",
-      message,
-      signature,
-      referralCode: REFERRAL,
+    headers: commonHeaders(jar, refCode, {
+      "content-type": "application/json",
     }),
+    redirect: "manual",
+    body: JSON.stringify(body),
   });
   jar.setFromHeader(
     res.headers.getSetCookie?.() ?? res.headers.get("set-cookie"),
   );
+  const location = res.headers.get("location") ?? "";
   if (res.status !== 302 && res.status !== 200) {
     const text = await res.text().catch(() => "");
-    throw new Error(`callback status ${res.status}: ${text.slice(0, 300)}`);
+    throw new Error(`callback status ${res.status}: ${text.slice(0, 200)}`);
+  }
+  if (location.includes("/auth/error")) {
+    throw new Error(`auth error redirect: ${location}`);
   }
 }
 
-async function fetchSession(jar) {
+async function fetchSession(jar, refCode) {
   const res = await fetch(`${ORIGIN}/auth/session`, {
     method: "GET",
-    headers: commonHeaders(jar),
+    headers: commonHeaders(jar, refCode),
   });
   jar.setFromHeader(
     res.headers.getSetCookie?.() ?? res.headers.get("set-cookie"),
@@ -213,45 +213,167 @@ async function fetchSession(jar) {
   return res.json().catch(() => ({}));
 }
 
-async function registerOne({ index, address, privateKey }) {
-  const wallet = new Wallet(privateKey);
-  if (wallet.address.toLowerCase() !== address.toLowerCase()) {
+// --- referral pool ---
+
+const referralPool = [
+  { code: SEED_REFERRAL, used: 0, max: REF_MAX, dead: false },
+];
+const candidateInviters = []; // {address, privateKey}
+
+function persistPool() {
+  try {
+    writeFileSync(poolPath, JSON.stringify(referralPool, null, 2) + "\n", {
+      mode: 0o600,
+    });
+  } catch {}
+}
+
+function pickReferral() {
+  return referralPool.find((r) => !r.dead && r.used < r.max) ?? null;
+}
+
+async function fetchReferralCodeFor({ address, privateKey }) {
+  const w = new Wallet(privateKey);
+  const jar = makeJar();
+  // Login flow without referralCode (already registered).
+  const nonce = await requestNonce(jar, null);
+  const csrfToken = await requestCsrf(jar, null);
+  const message = buildSiweMessage({ address, nonce });
+  const signature = await w.signMessage(message);
+  await submitCallback(jar, null, {
+    csrfToken,
+    method: "wallet",
+    callbackUrl: "/profile",
+    message,
+    signature,
+  });
+  const session = await fetchSession(jar, null);
+  const at = session?.accessToken;
+  if (!at) throw new Error(`no accessToken when reading referral`);
+  const r = await fetch(`${ORIGIN}/api/core/graphql`, {
+    method: "POST",
+    headers: commonHeaders(jar, null, {
+      "content-type": "application/json",
+      authorization: `Bearer ${at}`,
+    }),
+    body: JSON.stringify({
+      query:
+        "query Me { me { id referralCodes { edges { node { id code } } } } }",
+      variables: {},
+    }),
+  });
+  const j = await r.json();
+  const codes =
+    j?.data?.me?.referralCodes?.edges?.map((e) => e.node.code) ?? [];
+  if (codes.length === 0) throw new Error("user has no referral codes yet");
+  return codes[0];
+}
+
+let replenishing = null;
+async function replenishPool() {
+  if (replenishing) return replenishing;
+  replenishing = (async () => {
+    while (candidateInviters.length > 0) {
+      const inv = candidateInviters.shift();
+      try {
+        const code = await fetchReferralCodeFor(inv);
+        if (referralPool.some((r) => r.code === code)) continue;
+        referralPool.push({ code, used: 0, max: REF_MAX, dead: false });
+        persistPool();
+        logLine(
+          `  pool: + ${code} from ${inv.address} (pool size ${referralPool.length})`,
+        );
+        return;
+      } catch (e) {
+        logLine(
+          `  pool: skip ${inv.address} — ${String(e.message).slice(0, 100)}`,
+        );
+      }
+    }
+    throw new Error("referral pool empty and no candidate inviters left");
+  })();
+  try {
+    return await replenishing;
+  } finally {
+    replenishing = null;
+  }
+}
+
+// --- per-wallet registration with referral rotation ---
+
+async function registerOne(item) {
+  const wallet = new Wallet(item.privateKey);
+  if (wallet.address.toLowerCase() !== item.address.toLowerCase()) {
     throw new Error("csv address/privateKey mismatch");
   }
-
   if (DRY_RUN) {
-    const nonce = "DRYRUN000000000";
-    const msg = buildSiweMessage({ address, nonce });
-    const sig = await wallet.signMessage(msg);
+    const sig = await wallet.signMessage(
+      buildSiweMessage({ address: item.address, nonce: "X" }),
+    );
     return { userId: `dry:${sig.slice(0, 18)}` };
   }
 
-  // Cloudflare often returns 524 on the first callback for a brand new wallet
-  // because the origin's "create user + bind referral" path is slow. Retrying
-  // with the same wallet hits the cached user path and finishes in <1s.
-  // We also retry on upstream overload (503 "no available server"), throttles
-  // (429 Too Many Requests) and transient fetch failures.
-  const MAX_ATTEMPTS = 5;
+  const MAX_TRIES = 8; // includes referral rotations
   let lastErr;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+
+  for (let tries = 1; tries <= MAX_TRIES; tries++) {
+    let ref = pickReferral();
+    if (!ref) {
+      try {
+        await replenishPool();
+        ref = pickReferral();
+      } catch (e) {
+        throw new Error(`pool empty: ${e.message}`);
+      }
+    }
+    if (!ref) throw new Error("no usable referral code");
+
     const jar = makeJar();
     try {
-      const nonce = await requestNonce(jar);
-      const csrfToken = await requestCsrf(jar);
-      const message = buildSiweMessage({ address, nonce });
+      const nonce = await requestNonce(jar, ref.code);
+      const csrfToken = await requestCsrf(jar, ref.code);
+      const message = buildSiweMessage({ address: item.address, nonce });
       const signature = await wallet.signMessage(message);
-      await submitCallback(jar, { csrfToken, message, signature });
-      const session = await fetchSession(jar);
+      await submitCallback(jar, ref.code, {
+        csrfToken,
+        method: "wallet",
+        callbackUrl: "/profile",
+        message,
+        signature,
+        referralCode: ref.code,
+      });
+      const session = await fetchSession(jar, ref.code);
       const userId = session?.user?.id;
       if (!userId)
         throw new Error(
-          `no session.user.id: ${JSON.stringify(session).slice(0, 200)}`,
+          `no session.user.id: ${JSON.stringify(session).slice(0, 150)}`,
         );
-      return { userId, attempts: attempt };
+
+      ref.used++;
+      persistPool();
+      candidateInviters.push({
+        address: item.address,
+        privateKey: item.privateKey,
+      });
+      return { userId, refCode: ref.code };
     } catch (err) {
       lastErr = err;
       const msg = String(err?.message ?? err);
-      const retriable =
+
+      // referral-side failure → mark dead, rotate, retry without counting against wallet
+      if (/auth\/error|Configuration|no session\.user\.id/.test(msg)) {
+        if (!ref.dead) {
+          ref.dead = true;
+          persistPool();
+          logLine(
+            `  referral ${ref.code} marked DEAD after ${ref.used} uses — rotating`,
+          );
+        }
+        continue;
+      }
+
+      // transient network/Cloudflare → backoff, same code
+      const transient =
         /\b(429|502|503|504|524)\b/.test(msg) ||
         /timeout|fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(
           msg,
@@ -259,28 +381,40 @@ async function registerOne({ index, address, privateKey }) {
         /no available server|Too Many Requests|ThrottlerException|Bad gateway/i.test(
           msg,
         );
-      if (!retriable || attempt === MAX_ATTEMPTS) throw err;
-      // Exponential backoff with jitter: 5s, 15s, 45s, 90s
-      const base = [5000, 15000, 45000, 90000][attempt - 1] ?? 90000;
-      const wait = base + Math.floor(Math.random() * 3000);
-      logLine(
-        `  #${index} attempt ${attempt} retriable error, waiting ${wait}ms — ${msg.slice(0, 120)}`,
-      );
-      await new Promise((r) => setTimeout(r, wait));
+      if (transient && tries < MAX_TRIES) {
+        const wait = 5000 + tries * 5000 + Math.floor(Math.random() * 3000);
+        logLine(
+          `  #${item.index} attempt ${tries} transient — wait ${wait}ms — ${msg.slice(0, 100)}`,
+        );
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+
+      throw err;
     }
   }
-  throw lastErr;
+  throw lastErr ?? new Error("exhausted retries");
 }
 
-// --- main: bounded concurrency over the wallet slice ---
+// --- main ---
 
 const wallets = loadWallets().filter((w) => w.index >= FROM && w.index <= TO);
 const done = alreadyDone();
 const queue = wallets.filter((w) => !done.has(w.index));
 
+// Seed candidateInviters with wallets that already registered successfully
+// (from prior runs). This lets us rotate to a fresh referral code without
+// going through a brand-new signup first.
+for (const w of wallets) {
+  if (done.has(w.index)) {
+    candidateInviters.push({ address: w.address, privateKey: w.privateKey });
+  }
+}
+
 logLine(
-  `start referral=${REFERRAL} total=${wallets.length} pending=${queue.length} concurrency=${CONCURRENCY} delay=${DELAY}ms dry=${DRY_RUN}`,
+  `start seedReferral=${SEED_REFERRAL} refMax=${REF_MAX} total=${wallets.length} pending=${queue.length} candidateInviters=${candidateInviters.length} concurrency=${CONCURRENCY} delay=${DELAY}ms dry=${DRY_RUN}`,
 );
+persistPool();
 
 let cursor = 0;
 let okCount = 0;
@@ -290,13 +424,15 @@ async function worker(id) {
   while (cursor < queue.length) {
     const item = queue[cursor++];
     try {
-      const { userId } = await registerOne(item);
+      const { userId, refCode } = await registerOne(item);
       okCount++;
       appendFileSync(
         resultsPath,
         `${item.index},${item.address},ok,${userId},\n`,
       );
-      logLine(`  #${item.index} ${item.address} OK userId=${userId} (w${id})`);
+      logLine(
+        `  #${item.index} ${item.address} OK userId=${userId} ref=${refCode} (w${id})`,
+      );
     } catch (err) {
       failCount++;
       const msg = String(err?.message ?? err)
@@ -318,4 +454,6 @@ const workers = Array.from(
 );
 await Promise.all(workers);
 
-logLine(`done ok=${okCount} fail=${failCount} -> ${resultsPath}`);
+logLine(
+  `done ok=${okCount} fail=${failCount} pool=${referralPool.length} dead=${referralPool.filter((r) => r.dead).length} -> ${resultsPath}`,
+);
