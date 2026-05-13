@@ -1,0 +1,10 @@
+# Never commit secrets or state
+node_modules/
+output/
+*.log
+*.csv
+.DS_Store
+.env
+.env.*
+.idea/
+.vscode/

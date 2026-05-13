@@ -1,0 +1,17 @@
+{
+  "name": "beacon-register",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "gen": "node generate-wallets.js",
+    "gen:1": "node generate-wallets.js 1",
+    "gen:500": "node generate-wallets.js 500",
+    "capture": "node capture.js",
+    "register": "node register.js"
+  },
+  "dependencies": {
+    "ethers": "6.13.4",
+    "playwright": "1.48.2"
+  }
+}
