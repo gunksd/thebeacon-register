@@ -229,7 +229,9 @@ async function registerOne({ index, address, privateKey }) {
   // Cloudflare often returns 524 on the first callback for a brand new wallet
   // because the origin's "create user + bind referral" path is slow. Retrying
   // with the same wallet hits the cached user path and finishes in <1s.
-  const MAX_ATTEMPTS = 3;
+  // We also retry on upstream overload (503 "no available server"), throttles
+  // (429 Too Many Requests) and transient fetch failures.
+  const MAX_ATTEMPTS = 5;
   let lastErr;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const jar = makeJar();
@@ -250,9 +252,17 @@ async function registerOne({ index, address, privateKey }) {
       lastErr = err;
       const msg = String(err?.message ?? err);
       const retriable =
-        /\b(524|502|503|504|timeout|fetch failed|ECONNRESET)\b/i.test(msg);
+        /\b(429|502|503|504|524)\b/.test(msg) ||
+        /timeout|fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(
+          msg,
+        ) ||
+        /no available server|Too Many Requests|ThrottlerException|Bad gateway/i.test(
+          msg,
+        );
       if (!retriable || attempt === MAX_ATTEMPTS) throw err;
-      const wait = 2000 * attempt;
+      // Exponential backoff with jitter: 5s, 15s, 45s, 90s
+      const base = [5000, 15000, 45000, 90000][attempt - 1] ?? 90000;
+      const wait = base + Math.floor(Math.random() * 3000);
       logLine(
         `  #${index} attempt ${attempt} retriable error, waiting ${wait}ms — ${msg.slice(0, 120)}`,
       );
